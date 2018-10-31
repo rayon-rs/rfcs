@@ -31,4 +31,11 @@ regarding Rayon APIs are decided via the [Rayon core team]. The
 reasoning of those decisions will always be laid out in comments on
 the RFC itself.
 
-[Rayon core team]: https://github.com/orgs/rayon-rs/teams/core
+<a name=who-is-core></a>
+
+### Rayon core team
+
+The Rayon core team currently consists of nikomatsakis and cuviper.
+
+[Rayon core team]: #who-is-core
+

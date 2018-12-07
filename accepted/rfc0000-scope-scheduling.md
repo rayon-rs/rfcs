@@ -1,18 +1,18 @@
 # Summary
 [summary]: #summary
 
-- Introduce a new function, `fifo_scope`, which introduces a Rayon scope
+- Introduce a new function, `scope_fifo`, which introduces a Rayon scope
   that executes tasks in **per-thread FIFO** order; in this mode, at
   least with one worker thread, the tasks that are spawned first execute
   first. This is on contrast to the tradition Rayon `scope`, which
   executes in **per-thread LIFO** order, such that tasks that are
   spawned first execute last. Per-thread FIFO requires a small amount of
   indirection to implement but is important for some use-cases.
-- Introduce a new function, `fifo_spawn`, that pushes tasks onto the
+- Introduce a new function, `spawn_fifo`, that pushes tasks onto the
   implicit global scope. These tasks will also execute in FIFO order,
   in contrast to the [existing `spawn` function][spawn].
 - Deprecate the [existing `breadth_first` flag on `ThreadPool`][bf].
-  Users should migrate to creating a `fifo_scope` instead, as it is better
+  Users should migrate to creating a `scope_fifo` instead, as it is better
   behaved.
   - In the future, the `breadth_first` flag may be converted to a no-op.
 
@@ -149,14 +149,14 @@ we prefer a LIFO behavior, as it offers similar benefits.)
 
 We extend the rayon-core API to include two new functions and one new struct:
 
-- `fifo_scope(..) -> FifoScope<..>`
-- `fifo_spawn(..)`
+- `scope_fifo(..) -> ScopeFifo<..>`
+- `spawn_fifo(..)`
 
 The two functions are analogous to the existing [`scope`] and
 [`spawn`] functions respectively, except that they ensure **per-thread
-FIFO** ordering. The `FifoScope` struct is analogous to existing
+FIFO** ordering. The `ScopeFifo` struct is analogous to existing
 [`Scope`] struct -- it permits one to spawn new tasks that will
-execute before the `fifo_scope` function returns.
+execute before the `scope_fifo` function returns.
 
 [`scope`]: https://docs.rs/rayon/1.0.3/rayon/fn.scope.html
 [`spawn`]: https://docs.rs/rayon/1.0.3/rayon/fn.spawn.html
@@ -167,11 +167,11 @@ execute before the `fifo_scope` function returns.
 The `breadth_first` flag on thread-pools is **deprecated** but (for
 now) retains its current behavior. In some future rayon-core release,
 it may become a no-op, so users are encouraged to migrate to use
-`fifo_scope` or `fifo_spawn` instead.
+`scope_fifo` or `spawn_fifo` instead.
 
 # Implementation notes
 
-## Implementing `fifo_scope`
+## Implementing `scope_fifo`
 
 Rayon's core thread pool operates on the traditional work-stealing
 mechanism, where each worker thread has its own deque. New tasks are
@@ -234,7 +234,7 @@ today's code.
 [prototype implementation]: https://github.com/rayon-rs/rayon/pull/601#issuecomment-433242023
 [experiment]: https://github.com/rayon-rs/rayon/pull/601#issuecomment-433242023
 
-## Implementing `fifo_spawn`
+## Implementing `spawn_fifo`
 
 The traditional `spawn` function used by Rayon behaves (roughly) "as
 if" there were a global scope surrounding the worker thread: presuming
@@ -244,9 +244,9 @@ the task onto the current thread-local deque. (When executed from
 injector"; it will eventually be picked up by some worker thread and
 executed.)
 
-`fifo_spawn` can be implemented in an analogous way to `fifo_scope` by
+`spawn_fifo` can be implemented in an analogous way to `scope_fifo` by
 having each worker thread have a global FIFO, analogous to the FIFOs
-created in each `fifo_scope`. `fifo_spawn` then pushes the true task
+created in each `scope_fifo`. `spawn_fifo` then pushes the true task
 onto this FIFO as well as an "indirect task" onto the thread-local
 deque, exactly as described above.
 
@@ -304,9 +304,9 @@ per-thread LIFO tasks are a great fit, as they add minimal overhead.)
 [tsp]: https://github.com/rayon-rs/rayon/blob/a68b05ce524f79d7e7a5065714a8d3ca40ce8d4b/rayon-demo/src/tsp/
 [tsp-indirect]: https://github.com/rayon-rs/rayon/blob/a68b05ce524f79d7e7a5065714a8d3ca40ce8d4b/rayon-demo/src/tsp/step.rs#L50-L51
 
-**Should `fifo_scope` return a [`Scope`] and not a `FifoScope`?** The
+**Should `scope_fifo` return a [`Scope`] and not a `ScopeFifo`?** The
 [prototype implementation] shares the same `Scope` type for both
-`fifo_scope` and `scope`, and stores a boolean value to remember which
+`scope_fifo` and `scope`, and stores a boolean value to remember which
 "mode" is in use. This RFC proposes a distinct return type, which
 gives us the freedom to avoid using a dynamic boolean at runtime
 (though the implementation is not required to take advantage of that
@@ -316,7 +316,7 @@ freedom).
 RFC proposed making the `breadth_first` flag a no-op immediately. It
 was decided however to simply deprecate the flag but keep its current
 behavior for the time being: users of `breadth_first` are encouraged
-to migrate to `fifo_scope`, however, since the `breadth_first` flag
+to migrate to `scope_fifo`, however, since the `breadth_first` flag
 may become a no-op in the future (this would simplify the overall
 rayon-core implementation somewhat).
 

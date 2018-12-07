@@ -1,26 +1,23 @@
 # Summary
 [summary]: #summary
 
-Offer more variations on the `scope` construct that give more control
-over the relative scheduling of spawned tasks. The choices would be:
+- Introduce a new function, `fifo_scope`, which introduces a Rayon scope
+  that executes tasks in **per-thread FIFO** order; in this mode, at
+  least with one worker thread, the tasks that are spawned first execute
+  first. This is on contrast to the tradition Rayon `scope`, which
+  executes in **per-thread LIFO** order, such that tasks that are
+  spawned first execute last. Per-thread FIFO requires a small amount of
+  indirection to implement but is important for some use-cases.
+- Introduce a new function, `fifo_spawn`, that pushes tasks onto the
+  implicit global scope. These tasks will also execute in FIFO order,
+  in contrast to the [existing `spawn` function][spawn].
+- Deprecate the [existing `breadth_first` flag on `ThreadPool`][bf].
+  Users should migrate to creating a `fifo_scope` instead, as it is better
+  behaved.
+  - In the future, the `breadth_first` flag may be converted to a no-op.
 
-- **Default:** it is not important which tasks get scheduled when. Let
-  Rayon pick based on which can be most efficiently implemented. For
-  now, this is "per-thread LIFO", but it could change in the future.
-- **Per-thread LIFO:** The task that the current thread spawned most
-  recently will be the first to be executed. Thieves will steal the
-  thread that was spawned **first** (and thus would be the **last**
-  one that the current thread would execute). Tasks spawned by stolen
-  tasks will be processed first by the thief, again in a LIFO order,
-  but maybe stolen by other threads in turn. This is the current
-  default and can be implemented with the highest "micro efficiency".
-- **Per-thread FIFO:** The task that the current thread spawned first
-  is executed first. Thieves will also steal tasks in the same
-  order. Tasks spawned by stolen tasks will be processed first by the
-  thief. This is "roughly" the behavior today for thread-pools that
-  enabled the `breadth_first` scheduling option.
-- **Global FIFO:** Tasks always execute in the order in which they
-  were spawned, regardless of whether they were stolen or not.
+[spawn]: https://docs.rs/rayon/1.0.3/rayon/fn.spawn.html
+[bf]: https://docs.rs/rayon/1.0.2/rayon/struct.ThreadPoolBuilder.html#method.breadth_first
 
 # Motivation
 [motivation]: #motivation
@@ -36,11 +33,10 @@ users while ensuring that these options "compose well" with the
 overall system.
 
 [#590]: https://github.com/rayon-rs/rayon/issues/590
-[bf]: https://docs.rs/rayon/1.0.2/rayon/struct.ThreadPoolBuilder.html#method.breadth_first
 
 ## Current behavior: Per-thread LIFO
 
-By deafult, and presuming no stealing occurs, the current behavior of
+By default, and presuming no stealing occurs, the current behavior of
 a Rayon scope is to execute tasks in the reverse of the order that
 they are created. Therefore, in the following code, task 2 would
 execute first, and then task 1:
@@ -147,55 +143,35 @@ from B, and it is likely that the tasks spawned by B are going to
 re-use more of those cache lines than task C. (In general, this is why
 we prefer a LIFO behavior, as it offers similar benefits.)
 
-## Global FIFO
-
-Both the per-thread LIFO and per-thread FIFO orderings are somewhat
-dynamic and unpredictable. For some applications, it may be desirable
-to have tasks that execute in a fixed order. For this reason, we offer
-another option: global FIFO. In this ordering, tasks always begin
-execution in the same order that they were created.
-
 # Guide-level explanation
 
-We extend the rayon-core API to include a `ScopeBuilder`. Presently,
-the `ScopeBuilder` will offer three "construction" methods, used to
-select the mode:
+## New functions and types
 
-```rust
-pub struct ScopeBuilder {..}
+We extend the rayon-core API to include two new functions and one new struct:
 
-impl ScopeBuilder {
-  fn per_thread_lifo() -> Self { }
-  fn per_thread_fifo() -> Self { }
-  fn global_fifo() -> Self { }
-}
-```
+- `fifo_scope(..) -> FifoScope<..>`
+- `fifo_spawn(..)`
 
-Finally, the `ScopeBuilder` offers a method to construct the scope:
+The two functions are analogous to the existing [`scope`] and
+[`spawn`] functions respectively, except that they ensure **per-thread
+FIFO** ordering. The `FifoScope` struct is analogous to existing
+[`Scope`] struct -- it permits one to spawn new tasks that will
+execute before the `fifo_scope` function returns.
 
-```rust
-impl ScopeBuilder {
-  pub fn create<'scope, OP, R>(op: OP) -> R
-  where
-    OP: for<'s> FnOnce(&'s Scope<'scope>) -> R + 'scope + Send,
-    R: Send,
-  {
-    ..
-  }
-}
-```
+[`scope`]: https://docs.rs/rayon/1.0.3/rayon/fn.scope.html
+[`spawn`]: https://docs.rs/rayon/1.0.3/rayon/fn.spawn.html
+[`Scope`]: https://docs.rs/rayon/1.0.3/rayon/struct.Scope.html
 
-The existing `rayon::scope` function is then equivalent to
+## Deprecations
 
-```rust
-rayon::ScopeBuilder::per_thread_fifo().create(|scope| {
-  ..
-})
-```
+The `breadth_first` flag on thread-pools is **deprecated** but (for
+now) retains its current behavior. In some future rayon-core release,
+it may become a no-op, so users are encouraged to migrate to use
+`fifo_scope` or `fifo_spawn` instead.
 
 # Implementation notes
 
-## Controlling ordering
+## Implementing `fifo_scope`
 
 Rayon's core thread pool operates on the traditional work-stealing
 mechanism, where each worker thread has its own deque. New tasks are
@@ -222,32 +198,32 @@ then we should execute:
 
 Implementing **Per-thread LIFO** scheduling is therefore very
 easy. Each new job pushed onto the stack is simply pushed directly
-onto the deque.
+onto the back of the deque (if the `breadth_first` flag is true, then
+new tasks are pushed onto the front of the deque). Worker threads pop
+local tasks from the back of the deque but steal from the front.
 
-Implementing **Global FIFO** scheduling is a bit more complex but
-still fairly simple. The scope has an associated parallel FIFO. When a
-new task is spawned, we push the task onto this FIFO. We then **also**
-push an "indirect" task onto our thread-local deque.  Unlike in the
-per-thread LIFO case, this indirect task doesn't correspond to a
-specific task pushed by the user: it is merely a "token", indicating
-that there is work to be done. Like any other task, this "indirect
-task" may be popped locally or stolen. In either case, when it
-executes, the indirect task will first pop from the front of the
-scope's FIFO to obtain its actual job. It will then execute the task
-it finds there.
+Implementing **Per-thread FIFO** requires a certain amount of
+indirection. The scope creates N FIFOs, one per worker thread (as of
+this writing, the number of worker threads is fixed; if we later add
+the ability to grow or shrink the thread-pool dynamically, that will
+make this implementation somewhat more complex). When a new task is
+pushed onto a FIFO scope by the worker with index W, we actually push two items:
 
-Implementing **Per-thread FIFO** is similar. The scope creates N
-FIFOs, one per worker thread (as of this writing, the number of worker
-threads is fixed; if we later add the ability to grow or shrink the
-thread-pool dynamically, that will make this implementation somewhat
-more complex). When a new task is created in the worker thread with
-index X, it will be pushed onto the FIFO with index X. The indirect
-task also records this index X. When the "indirect task" is executed,
-it pops a task T from the FIFO X and executes it. But note that any
-new tasks pushed by this task T will be pushed onto the *current*
-thread, which is not necessarily the thread X.
+- First, we push the task itself onto the FIFO with index W.
+  This task contains the closure that needs to execute.
+- Second, we push an "indirect" task onto the worker's thread-local
+  deque. This task records the worker index W that created it, but
+  does not record the actual closure that needs to execute.
 
-Note that both FIFO modes do impose some "indirection overhead"
+Like any other task, this "indirect task" may be popped locally or
+stolen. In either case, when it executes, it must first find the
+closure to execute. To do that, it will find the FIFO for the worker W
+that created it and pop the next closure from the front, which it can
+then execute. Any new tasks pushed by this task T will be pushed onto
+the *current* thread, which is not necessarily the thread W that
+created it.
+
+Note that the FIFO mode does impose some "indirection overhead"
 relative to the LIFO execution mode. This is partly what motivates the
 default, as well backwards compatibility concerns. In any case, the
 overhead does not seem to be too large: the [prototype
@@ -257,6 +233,22 @@ today's code.
 
 [prototype implementation]: https://github.com/rayon-rs/rayon/pull/601#issuecomment-433242023
 [experiment]: https://github.com/rayon-rs/rayon/pull/601#issuecomment-433242023
+
+## Implementing `fifo_spawn`
+
+The traditional `spawn` function used by Rayon behaves (roughly) "as
+if" there were a global scope surrounding the worker thread: presuming
+that spawn is executed from inside a worker thread, it simply pushes
+the task onto the current thread-local deque. (When executed from
+**outside** a worker thread, the task is added to the "global
+injector"; it will eventually be picked up by some worker thread and
+executed.)
+
+`fifo_spawn` can be implemented in an analogous way to `fifo_scope` by
+having each worker thread have a global FIFO, analogous to the FIFOs
+created in each `fifo_scope`. `fifo_spawn` then pushes the true task
+onto this FIFO as well as an "indirect task" onto the thread-local
+deque, exactly as described above.
 
 # Rationale and alternatives
 
@@ -271,12 +263,12 @@ today's code.
 These two facts together motivate moving to something like the
 per-thread FIFO behavior described in this RFC.
 
-**Do we need multiple scheduling modes for scopes?** A serious
-alternative however would be to offer **only** this behavior, and not
-support per-thread LIFO nor global FIFO -- this is the design which
-e.g. [@stjepang is advocating for][stjepang-1]. In general, Rayon
-prefers offering fewer knobs, so that would be a general fit. However,
-there are some advantages to offering more scheduling modes:
+**Why offer both FIFO and LIFO modes?** A serious alternative however
+would be to offer **only** this behavior, and not support per-thread
+LIFO -- this is the design which e.g. [@stjepang is advocating
+for][stjepang-1]. In general, Rayon prefers offering fewer knobs, so
+that would be a general fit. However, there are some advantages to
+offering more scheduling modes:
 
 [stjepang-1]: https://github.com/rayon-rs/rfcs/pull/1#issuecomment-437074748
 
@@ -294,40 +286,39 @@ there are some advantages to offering more scheduling modes:
   per-thread LIFO is a good choice.** This also applies to
   applications that wish to choose another scheduling constraint (see
   the next section).
-- Global FIFO, meanwhile, is the only scheduling order of the 3 that is
-  independent from the work-stealing behavior.
 
 **Should we offer additional scheduling modes?** Another question
-worth considering is "why stop with these three modes"?  For example,
+worth considering is "why stop with these two modes"?  For example,
 the [Rayon demo application for solving the Travelling Salesman
 Problem][tsp] also [uses the "indirect task"
 trick][tsp-indirect]. However, in that case, it uses a (locked)
-priority queue to control the ordering. Rayon could conceivably offer
-some more flexible, priority-queue like mechanism as well. However,
-it's not clear that this is worth doing, since one can always achieve
-the same effect in "user space", as the TSP application does. (For
-this purpose, per-thread LIFO tasks are a great fit, as they add
-minimal overhead.)
+priority queue to control the ordering. Similarly, earlier versions of
+this RFC considered a "global FIFO" ordering where tasks always
+executed in the order they were pushed, regardless of whether they
+were stolen or not. Rayon could conceivably offer some more flexible,
+priority-queue like mechanism as well. However, it's not clear that
+this is worth doing, since one can always achieve the same effect in
+"user space", as the TSP application does. (For this purpose,
+per-thread LIFO tasks are a great fit, as they add minimal overhead.)
 
 [tsp]: https://github.com/rayon-rs/rayon/blob/a68b05ce524f79d7e7a5065714a8d3ca40ce8d4b/rayon-demo/src/tsp/
 [tsp-indirect]: https://github.com/rayon-rs/rayon/blob/a68b05ce524f79d7e7a5065714a8d3ca40ce8d4b/rayon-demo/src/tsp/step.rs#L50-L51
 
-**Is a builder really necessary?** We could simply add some more
-variants of `rayon::scope`, such as
-`rayon::scope_per_thread_fifo`. Perhaps that would be easier. We can
-always move to a builder at some later point.
+**Should `fifo_scope` return a [`Scope`] and not a `FifoScope`?** The
+[prototype implementation] shares the same `Scope` type for both
+`fifo_scope` and `scope`, and stores a boolean value to remember which
+"mode" is in use. This RFC proposes a distinct return type, which
+gives us the freedom to avoid using a dynamic boolean at runtime
+(though the implementation is not required to take advantage of that
+freedom).
 
-**Should we encode the scheduling mode in the type of the scope?** The
-prototype implementation of `Scope` stores the scheduling mode as an
-"enum". An alternative would be to use generics to encode the mode;
-this would avoid a dynamic `if` to select between per-thread
-LIFO/per-thread FIFO etc, but at the cost of more complexity in the
-user-visible types (it would also mean that we must expose more than
-one scope type, as the existing -- stable -- rayon-core API does not
-contain a generic). Given the performance measurements, it is unlikely
-that the more complex types are worthwhile. This change could also be
-made at some later time, conceivably, though it would require more
-additions to the `ScopeBuilder` API.
+**What to do with the `breadth_first` flag?** Earlier drafts of this
+RFC proposed making the `breadth_first` flag a no-op immediately. It
+was decided however to simply deprecate the flag but keep its current
+behavior for the time being: users of `breadth_first` are encouraged
+to migrate to `fifo_scope`, however, since the `breadth_first` flag
+may become a no-op in the future (this would simplify the overall
+rayon-core implementation somewhat).
 
 # Unresolved questions
 

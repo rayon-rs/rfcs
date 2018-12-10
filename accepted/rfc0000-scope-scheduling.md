@@ -26,11 +26,10 @@ The prioritization order for tasks can sometimes make a big difference
 to the overall system efficiency. Currently, Rayon offers only a
 single knob for tuning this behavior, in the form of [the
 `breadth_first` option][bf] on builds. This knob is not only rather
-coarse, it can lead turns out to have quite surprising behavior when
-one intermingles `scope` and `join` (including stack overflows, see
-[#590]). The goal of this RFC is to make more options available to
-users while ensuring that these options "compose well" with the
-overall system.
+coarse, it can lead to quite surprising behavior when one intermingles
+`scope` and `join` (including stack overflows, see [#590]). The goal
+of this RFC is to make more options available to users while ensuring
+that these options "compose well" with the overall system.
 
 [#590]: https://github.com/rayon-rs/rayon/issues/590
 
@@ -58,7 +57,7 @@ order of creation).
 the general "work stealing" implementation, where each thread has a
 deque of tasks. Each new task is pushed on to the back of the
 deque. The thread pops tasks from the back of the deque when executing
-locally, but steals from the front of the dequeue.
+locally, but steals from the front of the deque.
 
 ## Per-thread FIFO
 
@@ -100,20 +99,19 @@ mentioned.
 
 Instead of a flag on the threadpool, this RFC proposes to allow users
 to select the scheduling when constructing a scope. So stylo would
-create its scope not via `rayon::scope` but rather using the
-`ScopeBuilder`:
+create its scope using `rayon::scope_fifo` instead of `rayon::scope`:
 
 ```rust
-rayon::ScopeBuilder::per_thread_fifo().create(|scope| {
+rayon::scope_fifo(|scope| {
   ...
 });
 ```
 
-Creating a per-thread FIFO scope means that, when a thread goes to
-process a task that is part of the scope, it prefers first the tasks
-that were created most recently **within the current thread**. If we
-assume no stealing, then all tasks are created by one thread, and
-hence this is simply a FIFO ordering.
+Creating a FIFO scope means that, when a thread goes to process a task
+that is part of the scope, it prefers first the tasks that were
+created most recently **within the current thread**. If we assume no
+stealing, then all tasks are created by one thread, and hence this is
+simply a FIFO ordering.
 
 However, when stealing occurs, the ordering can get more complex and
 does not abide by a strict FIFO ordering. To illustrate, imagine that
@@ -147,18 +145,24 @@ we prefer a LIFO behavior, as it offers similar benefits.)
 
 ## New functions and types
 
-We extend the rayon-core API to include two new functions and one new struct:
+We extend the rayon-core API to include two new functions, as well as two
+corresponding methods on the `ThreadPool` struct:
 
-- `scope_fifo(..) -> ScopeFifo<..>`
-- `spawn_fifo(..)`
+- `scope_fifo(..)` and `ThreadPool::scope_fifo`
+- `spawn_fifo(..)` and `ThreadPool::spawn_fifo`
 
-The two functions are analogous to the existing [`scope`] and
-[`spawn`] functions respectively, except that they ensure **per-thread
-FIFO** ordering. The `ScopeFifo` struct is analogous to existing
-[`Scope`] struct -- it permits one to spawn new tasks that will
-execute before the `scope_fifo` function returns.
+These two functions (and methods) are analogous to the existing
+[`scope`] and [`spawn`] functions respectively, except that they
+ensure **per-thread FIFO** ordering.
+
+The `scope_fifo` function (and method) takes a closure implementing
+`FnOnce(&ScopeFifo<'scope>)` as argument. The `ScopeFifo` struct (also
+introduced by this RFC) is analogous to existing [`Scope`] struct --
+it permits one to spawn new tasks that will execute before the
+`scope_fifo` function returns.
 
 [`scope`]: https://docs.rs/rayon/1.0.3/rayon/fn.scope.html
+[scope_method]: https://docs.rs/rayon/1.0.3/rayon/struct.ThreadPool.html#method.scope
 [`spawn`]: https://docs.rs/rayon/1.0.3/rayon/fn.spawn.html
 [`Scope`]: https://docs.rs/rayon/1.0.3/rayon/struct.Scope.html
 
@@ -192,15 +196,16 @@ operation)[^global]. So, for example, if we have a thread nesting scopes like:
     
 then we should execute:
 
-- first, the tasks from the join (in reverse order, so B and then A)
+- first, the tasks from the join (in reverse order, so A and then B)
 - then, the tasks from S2, in the order that they were created
 - then, the tasks from S1, in the reverse order from which they were created.
 
 Implementing **Per-thread LIFO** scheduling is therefore very
 easy. Each new job pushed onto the stack is simply pushed directly
-onto the back of the deque (if the `breadth_first` flag is true, then
-new tasks are pushed onto the front of the deque). Worker threads pop
-local tasks from the back of the deque but steal from the front.
+onto the back of the deque. Worker threads pop local tasks from the
+back of the deque but steal from the front (if the `breadth_first`
+flag is true, then worker threads pop local tasks from the front as
+well).
 
 Implementing **Per-thread FIFO** requires a certain amount of
 indirection. The scope creates N FIFOs, one per worker thread (as of
@@ -212,8 +217,9 @@ pushed onto a FIFO scope by the worker with index W, we actually push two items:
 - First, we push the task itself onto the FIFO with index W.
   This task contains the closure that needs to execute.
 - Second, we push an "indirect" task onto the worker's thread-local
-  deque. This task records the worker index W that created it, but
-  does not record the actual closure that needs to execute.
+  deque. This task contains a reference to the FIFO for the worker
+  index W that created it, but does not record the actual closure that
+  needs to execute.
 
 Like any other task, this "indirect task" may be popped locally or
 stolen. In either case, when it executes, it must first find the
@@ -279,7 +285,7 @@ offering more scheduling modes:
 - Per-thread LIFO offers the **most efficient** implementation in a
   "micro" sense, as it can build directly on the work-stealing deques
   and does not require any indirection. It also has desirable cache
-  behavior, as threasd will tend to continue the "most recent thing"
+  behavior, as threads will tend to continue the "most recent thing"
   you were doing, which is also the thing where the caches are
   warmest, etc. **These two cases together argue that, for cases where
   the application doesn't otherwise care about execution order,

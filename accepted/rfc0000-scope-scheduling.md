@@ -159,12 +159,15 @@ The `scope_fifo` function (and method) takes a closure implementing
 `FnOnce(&ScopeFifo<'scope>)` as argument. The `ScopeFifo` struct (also
 introduced by this RFC) is analogous to existing [`Scope`] struct --
 it permits one to spawn new tasks that will execute before the
-`scope_fifo` function returns.
+`scope_fifo` function returns. It will offer one method,
+`ScopeFifo::spawn_fifo`, that permits one to spawn a (FIFO) task into
+the scope, analogous to [`Scope::spawn`].
 
 [`scope`]: https://docs.rs/rayon/1.0.3/rayon/fn.scope.html
 [scope_method]: https://docs.rs/rayon/1.0.3/rayon/struct.ThreadPool.html#method.scope
 [`spawn`]: https://docs.rs/rayon/1.0.3/rayon/fn.spawn.html
 [`Scope`]: https://docs.rs/rayon/1.0.3/rayon/struct.Scope.html
+[`Scope::spawn`]: https://docs.rs/rayon/1.0.3/rayon/struct.Scope.html#method.spawn
 
 ## Deprecations
 

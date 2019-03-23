@@ -10,16 +10,16 @@ Why are we doing this? What use cases does it support? What is the expected outc
 
 # Guide-level explanation
 
-How does this affect public Rayon APIs? If this is purely an
-implementation detail, it's ok to note that it doesn't affect Rayon
+How does this affect public SoloKeys products? If this is purely an
+implementation detail, it's ok to note that it doesn't affect SoloKeys
 users very much.
 
 # Implementation notes
 
 Describe at a high-level details of the implementation. This doesn't
-have to be super detailed; e.g., if we are adding a new
-`ParallelIterator` API, it it probably fine to leave some of this up
-to the Rayon PR. It is also fine to open a PR on the Rayon repository
+have to be super detailed; e.g., if we are adding new cryptographic
+functionality, it it probably fine to leave some of this up
+to the PR. It is also fine to open a PR on any SoloKeys repository
 and link it to this RFC (and vice versa).
 
 # Rationale and alternatives
@@ -32,4 +32,4 @@ and link it to this RFC (and vice versa).
 
 Anything left unresolved that we'll need to work out and evaluation
 during implementation? Feel free to leave this section blank if you
-can't think of anything.  "
+can't think of anything.

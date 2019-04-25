@@ -8,8 +8,8 @@ Set a formal policy for the minimum supported Rust version in `rayon` and
   chosen minimum will be at least one year old at the time we release any
   rayon crate requiring that.
 
-- Increases to our minimum supported Rust will also require a minor increase in
-  the semantic version of rayon crates.
+- Increases to our minimum supported Rust will also require a new minor release
+  in the semantic version of rayon crates, not just a patch release.
 
 # Motivation
 [motivation]: #motivation

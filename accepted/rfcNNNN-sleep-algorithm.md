@@ -71,12 +71,11 @@ closure for the job.  This job may in turn execute [`join`] or
 busy loop, but blocking on L2.
   
 The process for **considering going to sleep** is of course what we
-are defining in this document. The *current* process is described in
-[this README] but most of the details are not particularly relevant to
-this RFC, so they are not included except where needed.
+are defining in this document and is covered in future sections.
+Naturally, if a thread does go to sleep, it will wish to be awoken
+when either new work is available to be stolen or the latch becomes
+set.
 
-[this README]: https://github.com/rayon-rs/rayon/blob/68edcf6d12301cfdbe2a72fefada21fd45052891/rayon-core/src/sleep/README.md
-  
 ## Causes for events
 
 To start, let's list the various reasons that a Rayon thread may need
@@ -318,10 +317,40 @@ There are a number of opportunities to tweak this protocol:
 
 # Rationale and alternatives
 
-TODO. Discuss a bit:
+## Current behavior
 
-- current behavior of waking all threads
-- how we could get more precise 
+The current behavior differs in three respects from what is described
+in this document. A detailed look is available in [the README from the
+source][sleep-README].
+
+[sleep-README]: https://github.com/rayon-rs/rayon/blob/68edcf6d12301cfdbe2a72fefada21fd45052891/rayon-core/src/sleep/README.md
+
+First, the current sleep module always wakes **all** threads at once
+when a new event arrives. As such, it requries only a single mutex and
+a single condvar. This can be good: it ensures that threads are
+available to work as quickly as possible. But it also leads to high
+CPU usage.
+
+Once threads are awake, they can go to sleep individually, and so it
+is theoretically possible for Rayon to run at under full capacity. In
+practice, however, this is limited by the second difference: the
+current sleep module does not track which thread is waiting on what
+latch. As such, it must generate events to wake all threads each time
+a job is completed, and not only when new work is available. This is
+because completing a job may have released a latch that a sleeping
+thread was blocked on.
+
+Finally, the current sleep module has a more complex protocol for
+*going* to sleep. The complete sleep state is coordinated using a single
+`AtomicUsize`. In order for threads to go to sleep, they first register
+themselves in this usize as "the sleepy worker", and then do a bit more
+searching to steal work. Only once those searches have failed do they
+go to sleep. This means, among other things, that threads can only go
+to sleep one at a time.
+
+The advantage of this "sleep one at a time" system is that if new work
+*does* arrive in this period, a single atomic swap can be used to
+notify the sleepy worker and keep them awake.
 
 # Unresolved questions
 
@@ -389,3 +418,4 @@ and it undoubtedly has a name. There are also obviously variations of
 this protocol. For example, the SLEEPY state could be eliminated,
 which would yield fewer compare-and-exchange operations but
 potentially more locks. It may be worth doing some experimentation
+

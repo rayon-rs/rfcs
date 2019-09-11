@@ -81,9 +81,10 @@ set.
 To start, let's list the various reasons that a Rayon thread may need
 to wake from sleep:
 
-- **A new job is available**. This job can either come from within the
-  threadpool (e.g., by a call to [`join`]) or from outside the
-  threadpool.
+- **New jobs are available**. These jobs can either come from within
+  the threadpool (e.g., by a call to [`join`]) or from outside the
+  threadpool. Typically, we are only pushing a single new job, but in
+  some cases we may be creating multiple jobs at once.
 - **A [latch] has been set**. [Latches][latch] are the signaling
   mechanism used in Rayon to indicate when a job has completed. So,
   for example, a call to [`join`] cannot return until both closures
@@ -102,20 +103,19 @@ Let's look at each event in turn and see what kind of wakeup is most
 appropriate. Note that Rayon uses the playful term "tickling" for the
 act of waking a thread.
 
-### A new job is available
+### New jobs are available
 
-The correct response when a new job is available depends on the state
+The correct response when new jobs are available depends on the state
 of the other worker threads:
 
-- If any threads are currently **idle**, we should probably do nothing,
-  as they will likely come and steal the job.
-- If all other threads are either **sleeping** or **busy**, then we
-  should try to awaken another thread (presuming that there are any
-  still available).
+- If enough threads are currently **idle**, we should probably do
+  nothing, as they will likely come and steal the jobs.
+- Otherwise, we should try to awaken threads from sleep, so they can
+  come and do the work.
   
 So you can summarize the correct behavior here as:
 
-- If there are no idle threads:
+- If there are not enough idle threads:
   - If there are sleeping threads:
     - Pick one sleeping thread and wake it.
 
@@ -232,73 +232,33 @@ especially important. One possible implementation is covered in
 
 ### Mechanism to judge whether there are idle threads
 
-When injecting new work, we want to make a judgement whether there are
-idle threads -- that is, threads that are actively looking for work to
-steal. The idea is that if there are idle threads, we should avoid
-waking a thread from sleep, since the idle thread will likely find the
-work on its own. This itself is obviously something of a heuristic:
+When injecting new jobs, we want to make a judgement whether there are
+enough idle threads -- that is, threads that are actively looking for
+work to steal. The idea is that if there are idle threads, we should
+avoid waking a thread from sleep, since the idle threads will likely
+find the new jobs on their own. Note that typically we have only a
+single new job -- but in some cases we may have multiple new jobs at
+once.
 
-- we don't know if there have been other work items pushed that the idle thread 
-  has yet to find;
-- we don't know if the idle thread is *about* to go to sleep.
+This RFC proposes using atomic counters to track the number of idle
+and sleeping threads (the implementation packs the two counts into a
+`AtomicU64`, making it easy to update them together). Whenever a
+thread enters the stealing loop, it can increment the "idle thread"
+counter. Whenever it exits the stealing loop, it can decrement it.
+Similarly, when a thread goes to sleep, it increments the sleeping
+counter, and decrements the counter when awoken. (Note that, in this
+setup, sleeping threads are considered a subset of idle threads.)
 
-Later in the RFC, we'll discuss some of the ways we can tweak the
-proposed protocol to try and account for these scenarios.
+Using a counter has the downside that it means more atomic memory
+operations. It has the advantage however of being simple and making it
+easy for us to tell how many idle threads are active -- this way, when we
+are pushing multiple new jobs, we can tell if the number of new jobs exceeds
+the current number of idle threads.
 
-This section discusses two options for tracking whether there are idle
-threads.
-
-**Option A: The local-queue heuristic.**
-
-This RFC proposes a simple heuristic for judging whether there are
-idle threads: when a worker thread is about to push a new job onto its
-stack, it simply checks whether its local stack is presently empty. If
-not, that can be taken as a signal that all the other threads are
-busy, because they haven't found the time yet to steal our jobs. In
-contract, if the local stack is empty, it suggests that there *are*
-idle threads around.
-
-Obviously, this is just a heuristic. For example, the first push that
-a thread does will always judge other threads to be idle. To help with
-this scenario, we can augment the check by also tracking the total
-number of non-sleeping threads (using a global, atomic counter).
-
-Therefore, the check for a worker when pushing work can be:
-
-- If all other threads are sleeping: wake one of them.
-- Else, if my local stack is non-empty: wake one of them.
-
-NB. Rayon uses the [crossbeam-deque] package internally. Importantly,
-it offers the [`is_empty`] method for its queues.
-
-[crossbeam-deque]: https://crates.io/crates/crossbeam-deque
-[`is_empty`]: https://docs.rs/crossbeam-deque/0.7.1/crossbeam_deque/struct.Worker.html#method.is_empty
-
-**Option B: Track idle threads (more) precisely.**
-
-The obvious alternative is to introduce two counters: the number of
-sleeping threads *and* the number of idle threads. Whenever a thread
-enters the stealing loop, it can increment the "idle thread"
-counter. Whenever it exits the stealing loop, it can decrement it. 
-The plus side is that we can get a more reliable read on whether there
-are idle threads. To decide if there are idle threads, we can simply
-read the counter and check whether it is non-zero.
-
-The downside of this approach is that it involves more atomic
-increments. One particularly bad scenario is when a stealer thread
-steals a "leaf job" -- that is, a job that doesn't spawn any further
-jobs. This means that we'll decrement the "idle thread" counter upon
-stealing and then re-increment shortly thereafter.
-
-It should be noted that this tracking is *still* imprecise. As noted
-earlier, this is still ultimately a heuristic: there are still races
-where the thread might have concluded that it is time to go to sleep,
-or the thread might be about to find another job.
-
-**Which option?**
-
-This should be decided with experimentation. Both options are fairly
-easy to implement.
+Note that the number of idle/sleeping threads is a moving target, and
+thus any attempt to read the counters is always out of date. We
+discuss the implications of the race condition here in the [Race
+Conditions and Hazards][race-conditions] section below.
 
 ### Criteria threads use to decide when to sleep
 
@@ -306,18 +266,109 @@ As part of the busy loop, threads must decide when it is time to stop
 sealing and go to sleep. We propose using a simple counter: the thread
 will search at most N times, where N is determined by some xperientation.
 
-## Tuning opportunities
+[race-conditions]: #race-conditions-and-hazards
 
-There are a number of opportunities to tweak this protocol:
+## Race conditions and hazards
 
-- How many threads do we wake when new work arrives and we judge that
-  there are no idle threads? Instead of only waking 1 thread, it might make
-  sense to jump to a "threshold" point.
-- How 
+This section documents the various forms of degenerate cases that can
+occur, typically as a result of a race condition between a wakeup and
+a thread going to sleep, updating a counter, or something like that.
+
+One important change in this system vis-a-vis the existing system is
+that we distinguish notifications from *new work* from those that
+result from a *latch set*.  We cannot allow the latter to be missed,
+as that would result in "livelock" (in this case, a thread sleeping
+when it could have made progress).
+
+### Possible sources of missed hazards
+
+In contrast, notifications from new works can be "missed" in a number of
+ways in this system:
+
+- If a thread is about to go idle, new work might arrive shortly before,
+  which might lead to us waking an additional thread beyond what is needed.
+- If a new job arrives just as a thread is about to go to sleep, the
+  thread may still be considered idle. We woulld therefore skip waking a thread,
+  but the idle thread might go to sleep.
+  - This could be obviated by waking workers with the goal that there
+    be at least *2* idle threads, but that would cost more CPU time,
+    and doesn't completely eliminate the risk (both threads might be
+    about to go to sleep).
+- If two or more new jobs arrive at close to the same time, and there
+  is one idle thread, that thread will only be able to steal one of
+  them. The other will wait in a deque until an existing thread
+  finishes a job (or creates a new job, which would create a new
+  worker).
+
+### Conclusion
+
+Ultimately, the main danger highlighted above is that there could be a
+job that gets enqueued and which *could* be stolen if a thread was
+awoken, but that thread is never awoken because -- at the time of
+posting the job -- it didn't appear necessary.
+
+For workloads with a small number of jobs, it is possible for us to
+start fewer threads than the optimal number. If those jobs are cheap,
+that's not a big problem, but if they are expensive, it will result in
+subpar performance.
+
+If the number of jobs is approximately equal to the number of threads,
+this could be a problem. We only get one chance to start a thread per
+job. One way to potentially address this: in the code, if we know the
+number of new tasks being created ahead of time, we can try to ensure
+N threads are awake.
+
+If there are many, fine-grained jobs, then the likelihood of a problem
+is much smaller. Each new job offers us a fresh chance to start a new
+thread; if there are many jobs, then the existing threads should not
+be idle.  Moreover, there are not that many threads available,
+relative to the number of jobs, so soon they will all have started.
 
 # Rationale and alternatives
 
-## Current behavior
+## Potential avenues for future exploration
+
+This section contains some interesting ideas that may be worth
+exploring. They mostly represent minor variations on the protocol
+described in the RFC.
+
+### Judging idle threads by looking at the local queue
+
+The current "idle threads" tracking uses a global counter. One
+interesting alternative when a worker thread is pushing a new job is
+to have the thread check its local deque and see whether it is
+empty. The idea is that an empty deque likely indicates the presence
+of idle threads -- after all, there are enough worker threads to be
+stealing whatever work we have produced thus far. The advantage of
+this check is that it is local and does not require synchronized
+state. The disadvantage is that (a) this check only works from worker
+threads, (b) it is less precise, and (c) it cannot estimate how *many*
+idle threads there are. It is unclear how big these disadvantages are:
+most cases of new job are created by worker threads and consist of a
+single job, so (a) and (c) only rarely apply.
+
+This alternative is worth exploring further. In particular, it may
+yield advantages of machines with a large number of cores, as
+coordinating atomic updates may be more expensive in that environment.
+
+### Waking "blocks" of threads at once
+
+The current system wakes one thread at a time. It might be interesting
+to look into waking up 'blocks' of threads at once, in anticipation of
+their being new jobs created. For example, we might wake up to the
+smallest power of 2 -- so if we already have 5 active threads, we
+would start 3 more to bring the total to 8 (some of those might then
+fall back asleep). This represents something of a hybrid of the
+proposed system and the existing scheduler (described below), in that
+the existing Rayon scheduler always woke *all* threads and then
+allowed them to fall back asleep.
+
+## Related work
+
+This section contains summaries of some existing systems that were
+examined.
+
+### Current behavior
 
 The current behavior differs in three respects from what is described
 in this document. A detailed look is available in [the README from the
@@ -351,6 +402,16 @@ to sleep one at a time.
 The advantage of this "sleep one at a time" system is that if new work
 *does* arrive in this period, a single atomic swap can be used to
 notify the sleepy worker and keep them awake.
+
+### Go scheduler
+
+The go scheduler's approach to this problem is [summarized in this
+comment][go]. Based on a superficial read, it appears quite similar:
+when a new goroutine is created, if there are no idle threads (called
+"spinning"), then a new worker thread (called a "P", for processor) is
+awoken (called "unparked").
+
+[go]: https://github.com/golang/go/blob/b25ec50b693eae68de1f020a9566fa14dea47888/src/runtime/proc.go#L31
 
 # Unresolved questions
 

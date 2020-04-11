@@ -20,6 +20,10 @@ design options and tradeoffs available. It does not claim to be
 exhaustive and feedback is most certainly desired on alternative
 approaches!
 
+A video walkthrough of the new scheduler is [available on YouTube].
+
+[available on YouTube]: https://youtu.be/HvmQsE5M4cY
+
 # Guide-level explanation
 
 [how-rayon-works]: #how-rayon-works-at-a-high-level
@@ -175,6 +179,7 @@ This section goes into more detail on how the implementation will work.
 
 This section aims to give details on the following points:
 
+- The mechanism to guarantee there is always a thread awake when jobs are pending
 - The mechanism for threads to go to sleep and be awoken.
 - The mechanism for latches to know when a thread is sleeping on them.
 - The mechanism to judge whether there exist idle threads.
@@ -208,7 +213,7 @@ There are two kinds of latches that are relevant here:
 
 - [`SpinLatch`] -- awaits a single `set`, which causes it become, well, set. Used for [`join`].
 - [`CountLatch`] -- contains a counter that can be incremented and
-  decrementd. Once it reaches zero, the latch is set. Used for
+  decremented. Once it reaches zero, the latch is set. Used for
   [`scope`], where the counter tracks the number of active, spawned
   tasks.
 
@@ -230,7 +235,11 @@ The precise details of how these methods are implemented is not
 especially important. One possible implementation is covered in
 [Appendix A][appendix-a].
 
+### Tracking the number of 
+
 ### Mechanism to judge whether there are idle threads
+
+
 
 When injecting new jobs, we want to make a judgement whether there are
 enough idle threads -- that is, threads that are actively looking for
@@ -478,5 +487,5 @@ thinking about the problem. I'm sure I'm not the first to think of it,
 and it undoubtedly has a name. There are also obviously variations of
 this protocol. For example, the SLEEPY state could be eliminated,
 which would yield fewer compare-and-exchange operations but
-potentially more locks. It may be worth doing some experimentation
+potentially more locks. It may be worth doing some experimentation.
 

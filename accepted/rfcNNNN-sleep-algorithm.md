@@ -235,11 +235,7 @@ The precise details of how these methods are implemented is not
 especially important. One possible implementation is covered in
 [Appendix A][appendix-a].
 
-### Tracking the number of 
-
 ### Mechanism to judge whether there are idle threads
-
-
 
 When injecting new jobs, we want to make a judgement whether there are
 enough idle threads -- that is, threads that are actively looking for
